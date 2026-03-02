@@ -13,6 +13,58 @@ use anyhow::{Context, Result};
 
 use crate::{ResourceLimits, State};
 
+/// Path where the environment-sanitizing nspawn wrapper is installed.
+const NSPAWN_WRAPPER_PATH: &str = "/usr/local/libexec/sdme/nspawn-wrapper";
+
+/// Content of the wrapper script that sanitizes the environment before exec'ing nspawn.
+fn nspawn_wrapper_content(nspawn_path: &Path) -> String {
+    let nspawn = nspawn_path.display();
+    format!(
+        r#"#!/bin/bash
+# sdme nspawn wrapper — sanitizes dynamic linker environment variables
+# before exec'ing systemd-nspawn. This prevents LD_PRELOAD injection
+# into the nspawn process when sudo env preservation is misconfigured.
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT \
+      LD_DYNAMIC_WEAK LD_ORIGIN_PATH LD_PROFILE LD_SHOW_AUXV \
+      LD_USE_LOAD_BIAS
+exec {nspawn} "$@"
+"#
+    )
+}
+
+/// Installs the nspawn wrapper script if it doesn't exist or content has changed.
+fn ensure_nspawn_wrapper(nspawn_path: &Path, verbose: bool) -> Result<()> {
+    let wrapper_path = PathBuf::from(NSPAWN_WRAPPER_PATH);
+    let content = nspawn_wrapper_content(nspawn_path);
+
+    if let Some(parent) = wrapper_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let needs_write = if wrapper_path.exists() {
+        let existing = fs::read_to_string(&wrapper_path)
+            .with_context(|| format!("failed to read {}", wrapper_path.display()))?;
+        existing != content
+    } else {
+        true
+    };
+
+    if needs_write {
+        fs::write(&wrapper_path, &content)
+            .with_context(|| format!("failed to write {}", wrapper_path.display()))?;
+        // Make executable
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to chmod {}", wrapper_path.display()))?;
+        if verbose {
+            eprintln!("installed nspawn wrapper: {}", wrapper_path.display());
+        }
+    }
+
+    Ok(())
+}
+
 mod dbus {
     use anyhow::{bail, Context, Result};
     use zbus::blocking::proxy::Proxy;
@@ -683,7 +735,6 @@ pub fn resolve_paths() -> Result<UnitPaths> {
 pub fn unit_template(datadir: &str, paths: &UnitPaths) -> String {
     let mount = paths.mount.display();
     let umount = paths.umount.display();
-    let nspawn = paths.nspawn.display();
     format!(
         r#"[Unit]
 Description=sdme container %i
@@ -695,7 +746,7 @@ EnvironmentFile={datadir}/containers/%i/env
 ExecStartPre={mount} -t overlay overlay \
     -o lowerdir=${{LOWERDIR}},upperdir={datadir}/containers/%i/upper,workdir={datadir}/containers/%i/work \
     {datadir}/containers/%i/merged
-ExecStart={nspawn} \
+ExecStart={wrapper} \
     --directory={datadir}/containers/%i/merged \
     --machine=%i \
     --bind={datadir}/containers/%i/shared:/shared \
@@ -704,7 +755,8 @@ ExecStart={nspawn} \
 ExecStopPost=-{umount} {datadir}/containers/%i/merged
 KillMode=mixed
 Delegate=yes
-"#
+"#,
+        wrapper = NSPAWN_WRAPPER_PATH,
     )
 }
 
@@ -741,6 +793,8 @@ fn ensure_template_unit(datadir: &Path, verbose: bool) -> Result<()> {
         eprintln!("found umount: {}", paths.umount.display());
         eprintln!("found systemd-nspawn: {}", paths.nspawn.display());
     }
+
+    ensure_nspawn_wrapper(&paths.nspawn, verbose)?;
 
     let unit_path = Path::new("/etc/systemd/system/sdme@.service");
     let content = unit_template(datadir_str, &paths);
@@ -924,9 +978,11 @@ mod tests {
         assert!(template.contains("--resolv-conf=auto"));
         assert!(template.contains("--boot"));
         assert!(template.contains("Delegate=yes"));
-        assert!(template.contains("/usr/bin/systemd-nspawn"));
+        assert!(template.contains(NSPAWN_WRAPPER_PATH));
         assert!(template.contains("/usr/bin/mount"));
         assert!(template.contains("/usr/bin/umount"));
+        // The template should reference the wrapper, not systemd-nspawn directly.
+        assert!(!template.contains("/usr/bin/systemd-nspawn"));
     }
 
     #[test]
@@ -938,6 +994,40 @@ mod tests {
         assert!(template.contains("workdir=/tmp/custom/containers/%i/work"));
         assert!(template.contains("/tmp/custom/containers/%i/merged"));
         assert!(template.contains("--bind=/tmp/custom/containers/%i/shared:/shared"));
+    }
+
+    #[test]
+    fn test_nspawn_wrapper_content_has_unset() {
+        let content = nspawn_wrapper_content(Path::new("/usr/bin/systemd-nspawn"));
+        assert!(content.contains("unset LD_PRELOAD"));
+        assert!(content.contains("LD_LIBRARY_PATH"));
+        assert!(content.contains("LD_AUDIT"));
+        assert!(content.contains("LD_DEBUG "));
+        assert!(content.contains("LD_DEBUG_OUTPUT"));
+        assert!(content.contains("LD_DYNAMIC_WEAK"));
+        assert!(content.contains("LD_ORIGIN_PATH"));
+        assert!(content.contains("LD_PROFILE"));
+        assert!(content.contains("LD_SHOW_AUXV"));
+        assert!(content.contains("LD_USE_LOAD_BIAS"));
+    }
+
+    #[test]
+    fn test_nspawn_wrapper_content_execs_nspawn() {
+        let content = nspawn_wrapper_content(Path::new("/usr/bin/systemd-nspawn"));
+        assert!(content.contains("exec /usr/bin/systemd-nspawn \"$@\""));
+    }
+
+    #[test]
+    fn test_nspawn_wrapper_content_uses_resolved_path() {
+        let content = nspawn_wrapper_content(Path::new("/opt/custom/bin/systemd-nspawn"));
+        assert!(content.contains("exec /opt/custom/bin/systemd-nspawn \"$@\""));
+        assert!(!content.contains("/usr/bin/systemd-nspawn"));
+    }
+
+    #[test]
+    fn test_nspawn_wrapper_content_is_bash_script() {
+        let content = nspawn_wrapper_content(Path::new("/usr/bin/systemd-nspawn"));
+        assert!(content.starts_with("#!/bin/bash\n"));
     }
 
     #[test]
