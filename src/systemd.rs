@@ -765,6 +765,10 @@ Type=simple
 ExecStart=/bin/false
 KillMode=mixed
 Delegate=yes
+TasksMax=16384
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rwm
+DeviceAllow=char-pts rw
 "#
     .to_string()
 }
@@ -1087,6 +1091,10 @@ mod tests {
         assert!(template.contains("ExecStart=/bin/false"));
         assert!(template.contains("KillMode=mixed"));
         assert!(template.contains("Delegate=yes"));
+        assert!(template.contains("TasksMax=16384"));
+        assert!(template.contains("DevicePolicy=closed"));
+        assert!(template.contains("DeviceAllow=/dev/net/tun rwm"));
+        assert!(template.contains("DeviceAllow=char-pts rw"));
         // Template should NOT contain per-container details.
         assert!(!template.contains("EnvironmentFile"));
         assert!(!template.contains("systemd-nspawn"));
