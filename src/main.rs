@@ -1507,3 +1507,140 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sdme::network::NetworkConfig;
+    use std::fs;
+
+    /// Create a temp rootfs dir with an oci/ports file.
+    fn make_rootfs_with_ports(name: &str, ports_content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sdme-test-autowire-{}-{:?}-{name}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("oci")).unwrap();
+        fs::write(dir.join("oci/ports"), ports_content).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_auto_wire_oci_ports_private_network() {
+        let rootfs = make_rootfs_with_ports("priv", "80/tcp\n443/tcp\n");
+        let mut network = NetworkConfig {
+            private_network: true,
+            ..Default::default()
+        };
+
+        auto_wire_oci_ports(&rootfs, &mut network);
+
+        assert_eq!(network.ports.len(), 2);
+        assert!(network.ports.contains(&"80:80/tcp".to_string()));
+        assert!(network.ports.contains(&"443:443/tcp".to_string()));
+
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn test_auto_wire_oci_ports_skips_user_specified() {
+        let rootfs = make_rootfs_with_ports("skip", "80/tcp\n443/tcp\n8080/tcp\n");
+        let mut network = NetworkConfig {
+            private_network: true,
+            ports: vec!["9090:80/tcp".to_string()], // User already mapped container port 80
+            ..Default::default()
+        };
+
+        auto_wire_oci_ports(&rootfs, &mut network);
+
+        // Port 80 should NOT be added (user already specified it).
+        // Ports 443 and 8080 should be added.
+        assert_eq!(network.ports.len(), 3); // 1 user + 2 auto
+        assert!(network.ports.contains(&"9090:80/tcp".to_string())); // user's original
+        assert!(network.ports.contains(&"443:443/tcp".to_string()));
+        assert!(network.ports.contains(&"8080:8080/tcp".to_string()));
+        // Should NOT have a duplicate mapping for port 80.
+        assert!(
+            !network.ports.contains(&"80:80/tcp".to_string()),
+            "should not auto-forward port 80 when user already specified it"
+        );
+
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn test_auto_wire_oci_ports_host_network_no_forwarding() {
+        let rootfs = make_rootfs_with_ports("host", "80/tcp\n443/tcp\n");
+        let mut network = NetworkConfig {
+            private_network: false,
+            ..Default::default()
+        };
+
+        auto_wire_oci_ports(&rootfs, &mut network);
+
+        // Host network: no ports should be added.
+        assert!(
+            network.ports.is_empty(),
+            "host network should not add port forwarding rules"
+        );
+
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn test_auto_wire_oci_ports_no_ports_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "sdme-test-autowire-{}-{:?}-nofile",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // No oci/ports file.
+
+        let mut network = NetworkConfig {
+            private_network: true,
+            ..Default::default()
+        };
+
+        auto_wire_oci_ports(&dir, &mut network);
+
+        assert!(network.ports.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_auto_wire_oci_ports_empty_file() {
+        let rootfs = make_rootfs_with_ports("empty", "");
+        let mut network = NetworkConfig {
+            private_network: true,
+            ..Default::default()
+        };
+
+        auto_wire_oci_ports(&rootfs, &mut network);
+
+        assert!(network.ports.is_empty());
+
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn test_auto_wire_oci_ports_udp() {
+        let rootfs = make_rootfs_with_ports("udp", "53/udp\n80/tcp\n");
+        let mut network = NetworkConfig {
+            private_network: true,
+            ..Default::default()
+        };
+
+        auto_wire_oci_ports(&rootfs, &mut network);
+
+        assert_eq!(network.ports.len(), 2);
+        assert!(network.ports.contains(&"53:53/udp".to_string()));
+        assert!(network.ports.contains(&"80:80/tcp".to_string()));
+
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+}
