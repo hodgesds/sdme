@@ -262,7 +262,7 @@ pub(super) fn unpack_oci_layer<R: Read>(reader: R, dest: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs::File;
     use std::os::unix::fs as unix_fs;
@@ -278,6 +278,28 @@ mod tests {
         name: &str,
         layers: &[Vec<(&str, &[u8])>],
         use_manifest_index: bool,
+    ) -> PathBuf {
+        build_oci_tarball_inner(name, layers, use_manifest_index, None)
+    }
+
+    /// Like `build_oci_tarball`, but embeds a custom OCI config JSON blob.
+    ///
+    /// The `config_json` should be the raw bytes of the OCI image config
+    /// (the top-level `{ "config": { ... } }` structure), enabling tests
+    /// to construct images with entrypoint, cmd, ports, volumes, etc.
+    pub(crate) fn build_oci_tarball_with_config(
+        name: &str,
+        layers: &[Vec<(&str, &[u8])>],
+        config_json: &[u8],
+    ) -> PathBuf {
+        build_oci_tarball_inner(name, layers, false, Some(config_json))
+    }
+
+    fn build_oci_tarball_inner(
+        name: &str,
+        layers: &[Vec<(&str, &[u8])>],
+        use_manifest_index: bool,
+        custom_config: Option<&[u8]>,
     ) -> PathBuf {
         use sha2::{Digest, Sha256};
 
@@ -332,8 +354,9 @@ mod tests {
             }));
         }
 
-        // Build config blob (minimal).
-        let config_json = b"{}";
+        // Build config blob.
+        let default_config = b"{}";
+        let config_json: &[u8] = custom_config.unwrap_or(default_config);
         let config_hash = {
             let mut hasher = Sha256::new();
             hasher.update(config_json);

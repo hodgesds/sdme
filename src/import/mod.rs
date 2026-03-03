@@ -2753,4 +2753,565 @@ pub(crate) mod tests {
         assert!(err.to_string().contains("not found"), "unexpected: {err}");
         let _ = fs::remove_dir_all(&root);
     }
+
+    // --- OCI app image setup tests ---
+
+    /// Create a minimal base rootfs directory with fake systemd.
+    fn make_base_rootfs(datadir: &Path, name: &str) {
+        let base_dir = datadir.join("fs").join(name);
+        fs::create_dir_all(base_dir.join("usr/bin")).unwrap();
+        fs::write(base_dir.join("usr/bin/systemd"), "").unwrap();
+        fs::create_dir_all(base_dir.join("etc")).unwrap();
+    }
+
+    /// Create a minimal OCI app staging directory.
+    fn make_oci_staging(datadir: &Path, name: &str) -> PathBuf {
+        let staging = datadir.join("fs").join(format!(".{name}.importing"));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("app.bin"), "#!/bin/sh\necho hello\n").unwrap();
+        staging
+    }
+
+    /// Build an `OciContainerConfig` from a JSON value.
+    fn make_config(json: serde_json::Value) -> registry::OciContainerConfig {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_setup_app_image_basic() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "myapp");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/usr/bin/myapp"],
+            "Cmd": ["--serve"]
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "myapp",
+            "base",
+            &config,
+            "test-image:latest",
+            false,
+        )
+        .unwrap();
+
+        // OCI rootfs should be under staging/oci/root/.
+        assert!(staging.join("oci/root/app.bin").is_file());
+
+        // Service unit should exist.
+        let unit = staging.join("etc/systemd/system/sdme-oci-app.service");
+        assert!(unit.is_file());
+        let unit_content = fs::read_to_string(&unit).unwrap();
+        assert!(
+            unit_content.contains("ExecStart=/usr/bin/myapp --serve"),
+            "unit should contain ExecStart with entrypoint+cmd"
+        );
+
+        // Symlink for multi-user.target.wants.
+        let symlink =
+            staging.join("etc/systemd/system/multi-user.target.wants/sdme-oci-app.service");
+        assert!(symlink.symlink_metadata().unwrap().file_type().is_symlink());
+
+        // Essential runtime dirs.
+        assert!(staging.join("oci/root/tmp").is_dir());
+        assert!(staging.join("oci/root/run").is_dir());
+        assert!(staging.join("oci/root/var/tmp").is_dir());
+        assert!(staging.join("oci/root/var/run").is_dir());
+
+        // devfd shim.
+        assert!(staging.join("oci/root/.sdme-devfd-shim.so").is_file());
+    }
+
+    #[test]
+    fn test_setup_app_image_env_file() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "envapp");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"],
+            "Env": ["FOO=bar", "PATH=/usr/bin"]
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "envapp",
+            "base",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap();
+
+        let env_path = staging.join("oci/env");
+        assert!(env_path.is_file());
+        let env_content = fs::read_to_string(&env_path).unwrap();
+        assert!(env_content.contains("FOO=bar"));
+        assert!(env_content.contains("PATH=/usr/bin"));
+    }
+
+    #[test]
+    fn test_setup_app_image_ports() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "portapp");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"],
+            "ExposedPorts": {
+                "8080/tcp": {},
+                "443/tcp": {},
+                "53/udp": {}
+            }
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "portapp",
+            "base",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap();
+
+        let ports_path = staging.join("oci/ports");
+        assert!(ports_path.is_file());
+        let ports_content = fs::read_to_string(&ports_path).unwrap();
+        let lines: Vec<&str> = ports_content.lines().collect();
+        // Ports should be sorted.
+        assert_eq!(lines, vec!["443/tcp", "53/udp", "8080/tcp"]);
+    }
+
+    #[test]
+    fn test_setup_app_image_volumes() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "volapp");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"],
+            "Volumes": {
+                "/var/lib/data": {},
+                "/etc/config": {}
+            }
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "volapp",
+            "base",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap();
+
+        let volumes_path = staging.join("oci/volumes");
+        assert!(volumes_path.is_file());
+        let volumes_content = fs::read_to_string(&volumes_path).unwrap();
+        let lines: Vec<&str> = volumes_content.lines().collect();
+        // Volumes should be sorted.
+        assert_eq!(lines, vec!["/etc/config", "/var/lib/data"]);
+    }
+
+    #[test]
+    fn test_setup_app_image_working_dir() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "wdapp");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"],
+            "WorkingDir": "/app"
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "wdapp",
+            "base",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap();
+
+        let unit = staging.join("etc/systemd/system/sdme-oci-app.service");
+        let unit_content = fs::read_to_string(&unit).unwrap();
+        assert!(
+            unit_content.contains("WorkingDirectory=/app"),
+            "unit should contain WorkingDirectory=/app"
+        );
+    }
+
+    #[test]
+    fn test_setup_app_image_nonroot_user() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "userapp");
+
+        // Write a passwd file in the OCI rootfs.
+        fs::create_dir_all(staging.join("etc")).unwrap();
+        fs::write(
+            staging.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nnginx:x:101:101:nginx:/nonexistent:/sbin/nologin\n",
+        )
+        .unwrap();
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/usr/sbin/nginx"],
+            "Cmd": ["-g", "daemon off;"],
+            "User": "nginx"
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "userapp",
+            "base",
+            &config,
+            "nginx:latest",
+            false,
+        )
+        .unwrap();
+
+        // drop_privs binary should exist.
+        assert!(staging.join("oci/root/.sdme-drop-privs").is_file());
+
+        let unit = staging.join("etc/systemd/system/sdme-oci-app.service");
+        let unit_content = fs::read_to_string(&unit).unwrap();
+        // ExecStart should use drop_privs with uid/gid.
+        assert!(
+            unit_content.contains("/.sdme-drop-privs 101 101"),
+            "unit should use drop_privs for non-root user: {unit_content}"
+        );
+        // Should NOT contain User= directive.
+        assert!(
+            !unit_content.contains("\nUser="),
+            "unit should not have User= for non-root user (uses drop_privs instead)"
+        );
+    }
+
+    #[test]
+    fn test_setup_app_image_root_user() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "rootapp");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"],
+            "User": "root"
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "rootapp",
+            "base",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap();
+
+        // No drop_privs binary.
+        assert!(
+            !staging.join("oci/root/.sdme-drop-privs").exists(),
+            "drop_privs should not exist for root user"
+        );
+
+        let unit = staging.join("etc/systemd/system/sdme-oci-app.service");
+        let unit_content = fs::read_to_string(&unit).unwrap();
+        assert!(
+            unit_content.contains("User=root"),
+            "unit should contain User=root"
+        );
+    }
+
+    #[test]
+    fn test_setup_app_image_missing_base() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        // Don't create a base rootfs.
+        let staging = make_oci_staging(datadir, "nobase");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"]
+        }));
+
+        let err = setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "nobase",
+            "nonexistent",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("base rootfs not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_setup_app_image_no_entrypoint_or_cmd() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "noentry");
+
+        let config = make_config(serde_json::json!({}));
+
+        let err = setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "noentry",
+            "base",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("no Entrypoint or Cmd"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_setup_app_image_stop_signal() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "sigapp");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"],
+            "StopSignal": "SIGTERM"
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "sigapp",
+            "base",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap();
+
+        let unit = staging.join("etc/systemd/system/sdme-oci-app.service");
+        let unit_content = fs::read_to_string(&unit).unwrap();
+        assert!(
+            unit_content.contains("KillSignal=SIGTERM"),
+            "unit should contain KillSignal=SIGTERM"
+        );
+    }
+
+    #[test]
+    fn test_setup_app_image_ports_roundtrip() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "prtapp");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"],
+            "ExposedPorts": {
+                "80/tcp": {},
+                "443/tcp": {}
+            }
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "prtapp",
+            "base",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap();
+
+        // Verify read_oci_ports can parse what setup_app_image wrote.
+        let ports = crate::containers::read_oci_ports(&staging);
+        assert_eq!(ports.len(), 2);
+        // read_oci_ports returns "PORT:PORT/PROTO" format.
+        assert!(ports.contains(&"443:443/tcp".to_string()));
+        assert!(ports.contains(&"80:80/tcp".to_string()));
+    }
+
+    #[test]
+    fn test_setup_app_image_volumes_roundtrip() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "volrt");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"],
+            "Volumes": {
+                "/data": {},
+                "/var/log": {}
+            }
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "volrt",
+            "base",
+            &config,
+            "test:latest",
+            false,
+        )
+        .unwrap();
+
+        // Verify read_oci_volumes can parse what setup_app_image wrote.
+        let volumes = crate::containers::read_oci_volumes(&staging);
+        assert_eq!(volumes.len(), 2);
+        assert!(volumes.contains(&"/data".to_string()));
+        assert!(volumes.contains(&"/var/log".to_string()));
+    }
+
+    #[test]
+    fn test_setup_app_image_unit_comments() {
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+        let tmp = tmp();
+        let datadir = tmp.path();
+
+        make_base_rootfs(datadir, "base");
+        let staging = make_oci_staging(datadir, "cmtapp");
+
+        let config = make_config(serde_json::json!({
+            "Entrypoint": ["/app"],
+            "ExposedPorts": {"8080/tcp": {}},
+            "Volumes": {"/data": {}}
+        }));
+
+        setup_app_image(
+            datadir,
+            &staging,
+            &datadir.join("fs"),
+            "cmtapp",
+            "base",
+            &config,
+            "my-image:v1",
+            false,
+        )
+        .unwrap();
+
+        let unit = staging.join("etc/systemd/system/sdme-oci-app.service");
+        let unit_content = fs::read_to_string(&unit).unwrap();
+        // Unit should reference the image name.
+        assert!(unit_content.contains("my-image:v1"));
+        // Port and volume comments.
+        assert!(unit_content.contains("8080/tcp"));
+        assert!(unit_content.contains("/data"));
+    }
+
+    #[test]
+    fn test_import_oci_tarball_with_config() {
+        let tmp = tmp();
+        let _lock = INTERRUPT_LOCK.lock().unwrap();
+
+        let config_json = serde_json::to_vec(&serde_json::json!({
+            "config": {
+                "Entrypoint": ["/usr/bin/myapp"],
+                "Cmd": ["--serve"],
+                "ExposedPorts": {"8080/tcp": {}}
+            }
+        }))
+        .unwrap();
+
+        let tarball = oci::tests::build_oci_tarball_with_config(
+            "withcfg",
+            &[vec![("app.bin", b"#!/bin/sh\necho hi\n")]],
+            &config_json,
+        );
+
+        // Import through run() — this goes through the OCI tarball path,
+        // not the registry path, so oci_config won't be set. The import
+        // should succeed and extract the layer contents.
+        run(
+            tmp.path(),
+            &ImportOptions {
+                source: tarball.to_str().unwrap(),
+                name: "ocicfg",
+                verbose: false,
+                force: true,
+                interactive: false,
+                install_packages: InstallPackages::No,
+                oci_mode: OciMode::Auto,
+                base_fs: None,
+            },
+        )
+        .unwrap();
+
+        let rootfs = tmp.path().join("fs/ocicfg");
+        assert!(rootfs.is_dir());
+        assert_eq!(
+            fs::read_to_string(rootfs.join("app.bin")).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+
+        let _ = fs::remove_file(&tarball);
+    }
 }
