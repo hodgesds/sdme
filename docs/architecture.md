@@ -150,6 +150,10 @@ Everything sdme knows lives under `/var/lib/sdme` (the default
   |   |-- fedora/
   |   |-- nginx/               # OCI app rootfs
   |   +-- .ubuntu.meta         # distro metadata
+  |-- volumes/
+  |   +-- my-container/
+  |       |-- var-lib-mysql/   # OCI-declared volume data
+  |       +-- data/
   +-- pods/
       +-- my-pod/
           +-- state            # KEY=VALUE pod state (CREATED=...)
@@ -530,23 +534,39 @@ import time, and the generated unit includes
 containers (both root and non-root users). Full details in
 [docs/hacks.md](hacks.md).
 
+### OCI plumbing: ports and volumes
+
+OCI images declare exposed ports and volumes in their image config.
+sdme reads these from `/oci/ports` and `/oci/volumes` in the rootfs
+and auto-wires them at container creation time.
+
+**Port forwarding.** When the container uses a private network namespace
+(`--private-network`, `--hardened`, or `--strict`), sdme reads
+`/oci/ports` and adds `--port` rules mapping each declared port to the
+same host port. User `--port` flags take priority; matching ports are
+skipped. On host-network containers, no forwarding is needed (services
+bind directly to the host), so sdme prints an informational message
+instead. Suppressed with `--no-oci-ports`.
+
+**Volume mounts.** For each volume declared in `/oci/volumes`, sdme
+creates a host-side directory at
+`{datadir}/volumes/{container}/{volume-name}` and adds a bind mount
+mapping it to `/oci/root{volume-path}` inside the container. Volume
+data survives container removal (sdme prints the path but does not
+delete it). User `--bind` flags take priority: if the user binds to the
+same container path, the auto-mount is skipped. Suppressed with
+`--no-oci-volumes`.
+
+**Remaining caveat.** User-specified bind mounts (`-b`) and environment
+variables (`-e`) on the container operate at the nspawn level, not
+inside the `RootDirectory=/oci/root` chroot where the OCI application
+runs. OCI-declared volumes and ports are handled correctly because sdme
+maps volumes into the `/oci/root` subtree and ports operate at the
+network namespace level.
+
 ### Future direction
 
 At this point this is all very exploratory. This journey is 1% complete.
-
-**Important caveat.** OCI capsules (application images) currently have
-significant gaps. Bind mounts (`-b`) and environment variables (`-e`)
-set on the container operate at the nspawn level, not inside the
-`RootDirectory=/oci/root` chroot where the application actually runs.
-
-OCI-declared volumes are saved to `/oci/volumes` as metadata only and
-are not mounted. OCI-declared ports are saved to `/oci/ports` but are
-not automatically forwarded; the user must manually pass `--port` when
-creating the container.
-
-In short: the plumbing between the outer nspawn container and the inner
-chroot is incomplete. This is a known limitation and the TODOs live in
-the generated `sdme-oci-app.service` unit file.
 
 ## 9. Networking
 
